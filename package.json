@@ -1,0 +1,26 @@
+{
+  "name": "apt-realtime-orders",
+  "version": "1.0.0",
+  "description": "Real-time order update system using PostgreSQL LISTEN/NOTIFY and Socket.IO",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "keywords": [
+    "realtime",
+    "orders",
+    "postgresql",
+    "socket.io",
+    "listen-notify"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pg": "^8.13.3",
+    "socket.io": "^4.8.1"
+  }
+}

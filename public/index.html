@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Real-Time Order Monitor</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Real-Time Order Monitor</h1>
+    <div id="connection-status" class="status disconnected">
+      <span class="dot"></span>
+      <span id="status-text">Disconnected</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel orders-panel">
+      <h2>Orders</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Customer</th>
+            <th>Product</th>
+            <th>Status</th>
+            <th>Updated At</th>
+          </tr>
+        </thead>
+        <tbody id="orders-body">
+          <tr id="empty-row"><td colspan="5">Loading…</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel events-panel">
+      <h2>Live Events</h2>
+      <ul id="events-list">
+        <li class="empty">Waiting for events…</li>
+      </ul>
+    </section>
+  </main>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
