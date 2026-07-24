@@ -10,7 +10,7 @@ const server = http.createServer(app);
 const io = initSocket(server);
 
 server.listen(config.port, async () => {
-  console.log(`🚀 Server running on http://localhost:${config.port} [${config.nodeEnv}]`);
+  console.log(`🚀 Server running on port ${config.port} [${config.nodeEnv}]`);
 
   try {
     await dbListener.start();
