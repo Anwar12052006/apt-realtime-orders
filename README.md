@@ -1,411 +1,385 @@
-# Real-Time Order Update System
+# Real-Time Order Monitoring System (PostgreSQL WAL + Debezium CDC + Kafka)
 
-A backend system that automatically pushes order changes to connected browser clients in real time using **PostgreSQL LISTEN/NOTIFY**, database triggers, and **Socket.IO** — without any polling.
-
----
-
-## Problem Statement
-
-Build a system where connected clients automatically receive updates whenever an `INSERT`, `UPDATE`, or `DELETE` happens on a PostgreSQL `orders` table.
-
-**Key constraint:** Database changes must be detected even when SQL is executed **directly in PostgreSQL** (e.g., via `psql`, pgAdmin, or another application) — not only through the REST API.
+A production-oriented backend application that automatically streams PostgreSQL order changes to connected browser clients in real time using **PostgreSQL Write-Ahead Logging (WAL)**, **Debezium Change Data Capture (CDC)**, **Apache Kafka**, and **Socket.IO** — without polling or database triggers.
 
 ---
 
-## Architecture
+## 1. Problem Statement
+
+Modern real-time applications require instant feedback when database rows are created, updated, or deleted. 
+
+**Key Constraint:** Database mutations must be detected and broadcast in real time **even when SQL is executed directly in PostgreSQL** (e.g. via `psql`, pgAdmin, background jobs, or third-party services) — not just through Express REST endpoints.
+
+The architecture solves this by capturing changes directly from PostgreSQL's engine log (WAL) using Debezium CDC and streaming them through Kafka to Socket.IO.
+
+---
+
+## 2. Architecture Diagram
 
 ```
-┌─────────────────────────────┐
-│   PostgreSQL orders table   │
-│   (INSERT / UPDATE / DELETE)│
-└──────────────┬──────────────┘
-               │ AFTER trigger
-               ▼
-┌─────────────────────────────┐
-│   notify_order_change()     │
-│   PL/pgSQL trigger function │
-└──────────────┬──────────────┘
-               │ pg_notify('order_changes', JSON)
-               ▼
-┌─────────────────────────────┐
-│   Node.js LISTEN connection │
-│   (dedicated pg.Client)     │
-└──────────────┬──────────────┘
-               │ EventEmitter
-               ▼
-┌─────────────────────────────┐
-│   Socket.IO server          │
-│   io.emit('order-change')   │
-└──────────────┬──────────────┘
-               │ WebSocket
-               ▼
-┌─────────────────────────────┐
-│   Connected browser clients │
-└─────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│              PostgreSQL Database (`orders`)             │
+│        (Direct SQL / psql / REST API Mutations)         │
+└────────────────────────────┬────────────────────────────┘
+                             │ Write-Ahead Log (WAL)
+                             ▼
+┌─────────────────────────────────────────────────────────┐
+│        PostgreSQL Logical Decoding (`pgoutput`)         │
+└────────────────────────────┬────────────────────────────┘
+                             │ Replication Stream
+                             ▼
+┌─────────────────────────────────────────────────────────┐
+│           Debezium PostgreSQL Connector                 │
+│                 (Kafka Connect)                         │
+└────────────────────────────┬────────────────────────────┘
+                             │ CDC JSON Events
+                             ▼
+┌─────────────────────────────────────────────────────────┐
+│            Kafka Broker (`cdc.public.orders`)           │
+└────────────────────────────┬────────────────────────────┘
+                             │ Consumer Group
+                             ▼
+┌─────────────────────────────────────────────────────────┐
+│          Node.js CDC Consumer (`cdcConsumer.js`)        │
+└────────────────────────────┬────────────────────────────┘
+                             │ Internal EventEmitter (`order_change`)
+                             ▼
+┌─────────────────────────────────────────────────────────┐
+│          Socket.IO Bridge (`socketManager.js`)          │
+└────────────────────────────┬────────────────────────────┘
+                             │ WebSocket (`order-change`)
+                             ▼
+┌─────────────────────────────────────────────────────────┐
+│             Connected Web Clients (Browser UI)          │
+└─────────────────────────────────────────────────────────┘
 ```
 
-**The critical insight:** Because the trigger fires at the database level, **any** SQL change — whether from the REST API, a DBA running queries, a migration script, or another microservice — generates a real-time notification. The Node.js application layer is never bypassed.
+---
+
+## 3. What is Write-Ahead Logging (WAL)?
+
+The **Write-Ahead Log (WAL)** is PostgreSQL's internal, append-only log of all transactional modifications. Before any table row is updated or committed on disk, the change is written sequentially to the WAL. 
+
+In CDC architectures with `wal_level=logical`, PostgreSQL streams these WAL log entries to logical replication clients using the `pgoutput` plugin.
 
 ---
 
-## Why PostgreSQL LISTEN/NOTIFY?
+## 4. What is Change Data Capture (CDC)?
 
-| Approach | Mechanism | Drawback |
-|----------|-----------|----------|
-| **Client polling** | Browser calls `GET /api/orders` every N seconds | Wastes bandwidth; adds latency equal to the polling interval; doesn't scale |
-| **Server polling** | Node.js polls the DB for changes | Adds unnecessary load on PostgreSQL; still has latency |
-| **Application-level events** | Emit Socket.IO events from REST controllers | Misses changes made directly in PostgreSQL |
-| **LISTEN/NOTIFY** ✅ | PostgreSQL pushes events to subscribers | Zero polling; captures all changes at the source; sub-second latency |
-
-LISTEN/NOTIFY is the right tool here because the assignment explicitly requires detecting **direct SQL changes** — something that application-level event emitting cannot achieve.
+**Change Data Capture (CDC)** is a software pattern that observes, captures, and streams database row-level changes (`INSERT`, `UPDATE`, `DELETE`) in real time to external systems. Instead of querying tables periodically, CDC converts database transactions into an event stream.
 
 ---
 
-## Tech Stack
+## 5. What Does Debezium Do?
 
-| Technology | Purpose |
-|------------|---------|
-| **Node.js** | Server runtime |
-| **Express.js** | REST API framework |
-| **PostgreSQL** | Database with LISTEN/NOTIFY support |
-| **pg** | PostgreSQL client for Node.js |
-| **Socket.IO** | Real-time WebSocket communication |
-| **HTML/CSS/JS** | Minimal browser client |
-| **dotenv** | Environment variable management |
+[Debezium](https://debezium.io/) is an open-source, distributed Change Data Capture platform. 
+
+In this application:
+1. Debezium connects to PostgreSQL's logical replication slot (`orders_cdc_slot`).
+2. It reads raw WAL change streams via the `pgoutput` plugin.
+3. It parses binary WAL records into structured JSON change envelopes (`op: "c"|"u"|"d"|"r"`).
+4. It publishes these change envelopes to Kafka topic `cdc.public.orders`.
 
 ---
 
-## Project Structure
+## 6. Why Debezium Instead of Polling?
+
+| Feature | Client/Server Polling | Debezium CDC |
+| :--- | :--- | :--- |
+| **Database Impact** | High query load (`SELECT ... WHERE updated_at > ?`) | Zero query load; reads append-only WAL stream |
+| **Latency** | Polling interval (e.g. 5–30 seconds) | Sub-second real-time streaming |
+| **Missed Deletes** | Hard to detect without soft-delete columns | Instantly captures `DELETE` operations |
+| **Scalability** | Degrades exponentially with concurrent users | Highly scalable via Kafka partitions |
+
+---
+
+## 7. Why Debezium Instead of Application-Level Events?
+
+Emitting Socket.IO events inside Express REST controllers (e.g. `res.json(); io.emit(...)`) fails whenever database changes happen outside the Express controller — such as manual `psql` queries, background workers, or external microservices.
+
+Debezium captures database mutations **at the storage engine level**, guaranteeing 100% event capture regardless of where the SQL query originated.
+
+---
+
+## 8. Difference from PostgreSQL LISTEN/NOTIFY
+
+| Metric / Capability | PostgreSQL LISTEN/NOTIFY | Debezium CDC + Kafka |
+| :--- | :--- | :--- |
+| **Mechanism** | Synchronous PL/pgSQL triggers (`pg_notify`) | Asynchronous WAL log tailing (`pgoutput`) |
+| **Database Overhead** | Triggers execute inside caller transactions | Zero trigger overhead on SQL execution |
+| **Payload Limit** | Hard limit of 8,000 bytes per notification | Unbounded Kafka payload capacity |
+| **Persistence** | In-memory only (lost if listener is offline) | Persisted in Kafka topics & WAL slots |
+| **Replay & Catch-up** | Impossible (no event history) | Supported via Kafka offsets & replication slots |
+
+---
+
+## 9. Tech Stack
+
+- **Node.js**: Asynchronous server runtime.
+- **Express.js**: HTTP server & REST API framework.
+- **PostgreSQL 16**: Relational database with logical replication (`wal_level=logical`).
+- **Debezium Connect 2.6**: CDC connector framework reading PostgreSQL WAL.
+- **Apache Kafka 7.6 (KRaft)**: Event broker for CDC streams.
+- **KafkaJS**: Node.js client for Kafka consumption.
+- **Socket.IO**: Real-time WebSocket server.
+- **HTML5 / Vanilla CSS & JS**: Browser frontend monitor.
+
+---
+
+## 10. Project Structure
 
 ```
 apt-realtime-orders/
+├── database/
+│   ├── schema.sql                   # Schema definition & REPLICA IDENTITY FULL
+│   └── cleanup_triggers.sql         # Legacy trigger cleanup migration
+├── debezium/
+│   └── postgres-connector.json      # Declarative Debezium connector config
+├── public/
+│   ├── index.html                   # Dashboard UI
+│   ├── app.js                       # Socket.IO client logic
+│   └── style.css                    # UI styles
+├── scripts/
+│   └── register-connector.sh        # Automated connector registration script
 ├── src/
 │   ├── config/
-│   │   ├── index.js              # Environment variables & validation
-│   │   └── database.js           # PostgreSQL connection pool
+│   │   ├── database.js              # PostgreSQL pool
+│   │   └── index.js                 # App configuration
 │   ├── controllers/
-│   │   ├── health.js             # Health check handler
-│   │   └── order.js              # Order CRUD handlers + validation
+│   │   ├── health.js                # Liveness & readiness handlers
+│   │   └── order.js                 # Order REST controllers
 │   ├── routes/
-│   │   ├── health.js             # GET /health
-│   │   └── order.js              # /api/orders routes
+│   │   ├── health.js                # GET /health & GET /ready
+│   │   └── order.js                 # REST routes
 │   ├── services/
-│   │   ├── order.js              # SQL queries (parameterized)
-│   │   └── databaseListener.js   # PostgreSQL LISTEN + reconnection
+│   │   ├── cdcConsumer.js           # KafkaJS CDC event consumer
+│   │   └── order.js                 # Database queries
 │   ├── sockets/
-│   │   └── socketManager.js      # Socket.IO ↔ DB listener bridge
-│   ├── app.js                    # Express app setup
-│   └── server.js                 # HTTP server + graceful shutdown
-├── database/
-│   ├── schema.sql                # Table definition + seed data
-│   └── triggers.sql              # Trigger function + pg_notify
-├── public/
-│   ├── index.html                # Client UI
-│   ├── app.js                    # Socket.IO client logic
-│   └── style.css                 # Styling
-├── .env.example
-├── .gitignore
+│   │   └── socketManager.js         # Socket.IO ↔ CDC consumer bridge
+│   ├── app.js                       # Express app configuration
+│   └── server.js                    # HTTP server & graceful shutdown
+├── Dockerfile                       # Pinned Node.js multi-stage build
+├── docker-compose.yml               # Multi-container orchestration
+├── .env.example                     # Environment template
 ├── package.json
 └── README.md
 ```
 
 ---
 
-## Database Schema
+## 11. Environment Variables
 
-```sql
-CREATE TABLE IF NOT EXISTS orders (
-  id            SERIAL PRIMARY KEY,
-  customer_name VARCHAR(100)  NOT NULL,
-  product_name  VARCHAR(150)  NOT NULL,
-  status        VARCHAR(20)   NOT NULL DEFAULT 'pending'
-                CHECK (status IN ('pending', 'shipped', 'delivered')),
-  updated_at    TIMESTAMP     NOT NULL DEFAULT NOW()
-);
-```
-
-The `CHECK` constraint ensures only valid statuses are stored — enforced at the database level regardless of how the data is inserted.
-
----
-
-## Installation
-
-```bash
-git clone <repository-url>
-cd apt-realtime-orders
-npm install
-```
-
----
-
-## Environment Variables
-
-Copy the example file and fill in your PostgreSQL credentials:
-
-```bash
-cp .env.example .env
-```
+Create `.env` from `.env.example`:
 
 ```env
+# Server Configuration
 PORT=3000
 NODE_ENV=development
 
-DB_HOST=localhost
+# PostgreSQL Configuration
+DB_HOST=postgres
 DB_PORT=5432
-DB_USER=your_pg_user
-DB_PASSWORD=your_pg_password
+DB_USER=postgres
+DB_PASSWORD=postgres
 DB_NAME=apt_realtime_orders
-```
 
-The application validates that all required database variables are present at startup and fails fast with a clear error if any are missing.
+# Kafka Configuration
+KAFKA_BROKERS=kafka:9092
+KAFKA_CLIENT_ID=realtime-orders-app
+KAFKA_GROUP_ID=order-monitoring-group
+KAFKA_TOPIC=cdc.public.orders
 
----
-
-## Database Setup
-
-```bash
-# 1. Create the database
-createdb apt_realtime_orders
-
-# 2. Create the orders table and seed data
-psql -U your_pg_user -d apt_realtime_orders -f database/schema.sql
-
-# 3. Create the trigger function and trigger
-psql -U your_pg_user -d apt_realtime_orders -f database/triggers.sql
-```
-
-Both SQL files are idempotent and can be safely re-run.
-
----
-
-## Running the Application
-
-```bash
-# Production
-npm start
-
-# Development (auto-restart on file changes)
-npm run dev
-```
-
-Expected startup output:
-
-```
-🚀 Server running on http://localhost:3000 [development]
-📡 Listening on PostgreSQL channel "order_changes"
-```
-
-Open `http://localhost:3000` in your browser to view the real-time order monitor.
-
----
-
-## REST API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/health` | Health check |
-| `GET` | `/api/orders` | List all orders |
-| `GET` | `/api/orders/:id` | Get a single order |
-| `POST` | `/api/orders` | Create an order |
-| `PATCH` | `/api/orders/:id` | Update an order |
-| `DELETE` | `/api/orders/:id` | Delete an order |
-
-### Create Order
-
-```bash
-curl -X POST http://localhost:3000/api/orders \
-  -H "Content-Type: application/json" \
-  -d '{"customer_name": "Anwar Raza", "product_name": "Laptop", "status": "pending"}'
-```
-
-### Update Order
-
-```bash
-curl -X PATCH http://localhost:3000/api/orders/1 \
-  -H "Content-Type: application/json" \
-  -d '{"status": "shipped"}'
-```
-
-### Delete Order
-
-```bash
-curl -X DELETE http://localhost:3000/api/orders/1
+# Debezium Connect Configuration
+DEBEZIUM_CONNECT_URL=http://debezium:8083
 ```
 
 ---
 
-## Real-Time Event Format
+## 12. Docker Setup
 
-All connected clients receive events via Socket.IO on the `order-change` channel:
+The architecture is containerized using `docker-compose.yml`:
 
-### INSERT
+- **`postgres`**: PostgreSQL 16 with `wal_level=logical`.
+- **`kafka`**: Apache Kafka 7.6 operating in KRaft mode.
+- **`debezium`**: Debezium Connect 2.6 engine.
+- **`debezium-init`**: One-off container that registers the PostgreSQL CDC connector.
+- **`app`**: Node.js Express server + Socket.IO + Kafka CDC Consumer.
+
+---
+
+## 13. Debezium Connector Registration
+
+Connector configuration (`debezium/postgres-connector.json`):
 
 ```json
 {
-  "operation": "INSERT",
-  "data": {
-    "id": 6,
-    "customer_name": "Anwar Raza",
-    "product_name": "Laptop",
-    "status": "pending",
-    "updated_at": "2026-07-24T10:15:00.000000"
+  "name": "orders-cdc-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "plugin.name": "pgoutput",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "postgres",
+    "database.password": "postgres",
+    "database.dbname": "apt_realtime_orders",
+    "topic.prefix": "cdc",
+    "schema.include.list": "public",
+    "table.include.list": "public.orders",
+    "slot.name": "orders_cdc_slot",
+    "publication.name": "orders_cdc_publication",
+    "publication.autocreate.mode": "filtered",
+    "snapshot.mode": "initial",
+    "tombstones.on.delete": "false",
+    "slot.drop.on.stop": "false"
   }
 }
 ```
 
-### UPDATE
+Registration script (`scripts/register-connector.sh`):
+
+```bash
+sh scripts/register-connector.sh
+```
+
+---
+
+## 14. Running the Application
+
+### Option A: Complete Docker Compose Stack (Recommended)
+
+```bash
+# Build and start all services in detached mode
+docker compose up --build -d
+
+# Check status of containers
+docker compose ps
+
+# View application logs
+docker compose logs -f app
+```
+
+Open `http://localhost:3000` in your web browser.
+
+### Option B: Local Node.js Development (Connecting to Docker Services)
+
+```bash
+# 1. Start infrastructure services (PostgreSQL, Kafka, Debezium)
+docker compose up -d postgres kafka debezium debezium-init
+
+# 2. Update .env for local host connections
+DB_HOST=localhost
+KAFKA_BROKERS=localhost:9092
+
+# 3. Start Node.js application locally
+npm run dev
+```
+
+---
+
+## 15. REST API Endpoints
+
+| Method | Path | Description |
+| :--- | :--- | :--- |
+| `GET` | `/health` | Liveness probe (HTTP 200) |
+| `GET` | `/ready` | Readiness probe (Checks PostgreSQL & CDC Consumer status) |
+| `GET` | `/api/orders` | Fetch all orders |
+| `GET` | `/api/orders/:id` | Fetch order by ID |
+| `POST` | `/api/orders` | Create a new order |
+| `PATCH` | `/api/orders/:id` | Update order fields |
+| `DELETE` | `/api/orders/:id` | Delete an order |
+
+---
+
+## 16. Real-Time Event Format
+
+Connected Socket.IO clients receive normalized events on the `order-change` topic:
 
 ```json
 {
-  "operation": "UPDATE",
+  "operation": "INSERT" | "UPDATE" | "DELETE",
   "data": {
     "id": 1,
     "customer_name": "Alice Johnson",
     "product_name": "Mechanical Keyboard",
     "status": "shipped",
-    "updated_at": "2026-07-24T10:20:00.000000"
-  }
-}
-```
-
-### DELETE
-
-```json
-{
-  "operation": "DELETE",
-  "data": {
-    "id": 3,
-    "customer_name": "Charlie Lee",
-    "product_name": "27\" 4K Monitor",
-    "status": "delivered",
-    "updated_at": "2026-07-24T10:10:00.000000"
+    "updated_at": "2026-07-27T18:00:00.000Z"
   }
 }
 ```
 
 ---
 
-## Testing Real-Time Updates
+## 17. Direct PostgreSQL INSERT / UPDATE / DELETE Testing
 
-This is the most important test — proving that the system detects changes made **outside** the Node.js application.
+Test that direct database operations bypass the REST API and stream to web browsers:
 
-### Setup
+```bash
+# 1. Connect directly to PostgreSQL container
+docker compose exec postgres psql -U postgres -d apt_realtime_orders
+```
 
-1. **Terminal 1:** Start the server — `npm run dev`
-2. **Browser:** Open `http://localhost:3000` (open two tabs to verify broadcast)
-3. **Terminal 2:** Connect directly to PostgreSQL — `psql -U your_pg_user -d apt_realtime_orders`
-
-### Direct SQL Test
-
-In Terminal 2, execute:
+Run SQL queries:
 
 ```sql
--- The browser will update instantly after each statement
+-- 1. INSERT test
+INSERT INTO orders (customer_name, product_name, status) 
+VALUES ('Direct SQL User', 'Mechanical Keyboard', 'pending');
 
--- 1. Insert a new order
-INSERT INTO orders (customer_name, product_name, status)
-VALUES ('Test User', 'Widget', 'pending');
+-- 2. UPDATE test
+UPDATE orders 
+SET status = 'shipped', updated_at = NOW() 
+WHERE customer_name = 'Direct SQL User';
 
--- 2. Update the status
-UPDATE orders SET status = 'shipped', updated_at = NOW()
-WHERE id = 1;
-
--- 3. Delete an order
-DELETE FROM orders WHERE id = 1;
+-- 3. DELETE test
+DELETE FROM orders 
+WHERE customer_name = 'Direct SQL User';
 ```
 
-**Expected result:** Each SQL statement immediately appears in the browser — a new row is added, the status badge changes, or the row disappears. The server log shows:
-
-```
-📦 INSERT on order id=6
-📦 UPDATE on order id=1
-📦 DELETE on order id=1
-```
-
-**This works because** the PostgreSQL trigger fires on every row change regardless of the source. The `pg_notify()` call pushes the event to the Node.js LISTEN connection, which then broadcasts via Socket.IO. The REST API is never involved.
+Observe browser UI at `http://localhost:3000` updating instantly in real time!
 
 ---
 
-## Design Decisions
+## 18. How to Verify Kafka / Debezium Events
 
-| Decision | Rationale |
-|----------|-----------|
-| **Dedicated `pg.Client` for LISTEN** | `pg.Pool` recycles connections — a pooled connection would lose its `LISTEN` subscription when returned to the pool. A dedicated `Client` maintains a persistent connection. |
-| **EventEmitter between DB listener and Socket.IO** | Decouples PostgreSQL-specific code from the WebSocket layer. The listener emits events; the socket layer subscribes. Neither knows about the other's internals. |
-| **Triggers instead of application-level events** | The assignment requires detecting direct SQL changes. Emitting events from Express controllers would miss changes made via `psql` or other applications. |
-| **`AFTER` trigger (not `BEFORE`)** | Ensures notifications are only sent for changes that actually committed — no false positives from rolled-back transactions. |
-| **`http.createServer` instead of `app.listen`** | Both Express and Socket.IO share the same HTTP server. This is required for Socket.IO to intercept WebSocket upgrade requests. |
-| **Parameterized queries with hardcoded column allowlist** | The dynamic `PATCH` query builds `SET` clauses from a whitelist of column names (`customer_name`, `product_name`, `status`). User input only flows through `$1, $2, …` parameters — never concatenated into SQL. |
-| **Reconnection with exponential backoff** | If PostgreSQL restarts, the LISTEN connection automatically reconnects (1s → 2s → 4s → … → 30s max) instead of silently going dead. |
-| **Graceful shutdown** | `SIGINT`/`SIGTERM` handlers close Socket.IO, the LISTEN client, the connection pool, and the HTTP server in order — no dangling connections. |
+### Verify Debezium Connector Status
 
----
-
-## Scalability
-
-### Current Design (Single Instance)
-
-```
-1 LISTEN connection ──→ 1 Node.js process ──→ N WebSocket clients
+```bash
+curl -s http://localhost:8083/connectors/orders-cdc-connector/status | jq .
 ```
 
-This architecture handles **one application instance** efficiently. PostgreSQL maintains a single notification channel, and Socket.IO broadcasts to all connected clients through that instance.
+### Consume Raw CDC Messages from Kafka Topic
 
-### Horizontal Scaling Considerations
-
-If the application needs to scale beyond a single Node.js process:
-
-- **Socket.IO + Redis adapter:** Use `@socket.io/redis-adapter` to share WebSocket events across multiple Node.js instances. Each instance maintains its own LISTEN connection, and Redis ensures events reach all clients regardless of which instance they're connected to.
-
-- **PostgreSQL LISTEN/NOTIFY limitations:** NOTIFY payloads are limited to ~8,000 bytes. For tables with very large rows, the payload would need to be reduced (e.g., send only the ID and operation, then fetch the full row on the client). LISTEN/NOTIFY is also in-memory and does not persist — if no listener is connected, notifications are lost.
-
-- **For much larger architectures:** At high scale (thousands of events per second), a dedicated message broker like **RabbitMQ** or **Apache Kafka** would replace LISTEN/NOTIFY. PostgreSQL would publish to the broker via logical replication or Change Data Capture (CDC), and consumers would process events independently.
-
-> **Note:** Redis, Kafka, and RabbitMQ are **not implemented** in this project. They are mentioned here as natural evolution paths for the architecture.
+```bash
+docker compose exec kafka kafka-console-consumer \
+  --bootstrap-server localhost:9092 \
+  --topic cdc.public.orders \
+  --from-beginning
+```
 
 ---
 
-## Error Handling
+## 19. Graceful Shutdown
 
-| Scenario | Behavior |
-|----------|----------|
-| Missing environment variables | Application fails fast at startup with a clear error message |
-| PostgreSQL unreachable at startup | Server starts; DB listener logs error and retries with backoff |
-| LISTEN connection drops | Automatic reconnection with exponential backoff (1s → 30s cap) |
-| Malformed notification payload | Caught, logged, and skipped — server continues running |
-| Invalid request body | Returns `400` with descriptive validation errors |
-| Non-numeric order ID | Returns `400` `"Invalid order ID"` |
-| Order not found | Returns `404` `"Order not found"` |
-| Invalid status value (API) | Returns `400` with allowed values |
-| Invalid status value (SQL) | Blocked by PostgreSQL `CHECK` constraint — no notification sent |
-| Unhandled promise rejection | Caught by global handler, logged, process continues |
-| `SIGINT` / `SIGTERM` | Graceful shutdown: Socket.IO → LISTEN client → pool → HTTP server |
+The application intercepts `SIGINT` and `SIGTERM` signals and executes shutdown procedures in order:
+
+1. Close Socket.IO server connections (`io.close()`).
+2. Disconnect Kafka CDC Consumer (`cdcConsumer.stop()`).
+3. Drain and terminate PostgreSQL connection pool (`pool.end()`).
+4. Close HTTP server socket (`server.close()`).
 
 ---
 
-## Limitations
+## 20. Failure & Recovery Behavior
 
-- **No authentication or authorization** — all endpoints and WebSocket connections are open.
-- **No pagination** on `GET /api/orders` — suitable for small datasets only.
-- **Single-instance** — horizontal scaling would require a Socket.IO Redis adapter.
-- **pg_notify payload limit** — PostgreSQL limits NOTIFY payloads to ~8KB. Very large rows may be truncated.
-- **No message persistence** — if the LISTEN connection is down during a change, that notification is lost. A page refresh re-syncs via the REST API.
+- **PostgreSQL Crash**: `pg.Pool` automatically retries connection acquisition. Debezium resumes from its last confirmed LSN once PostgreSQL recovers.
+- **Kafka Broker Outage**: `KafkaJS` consumer retries connection using exponential backoff without crashing the application process.
+- **Debezium Container Restart**: The replication slot (`orders_cdc_slot`) persists in PostgreSQL (`slot.drop.on.stop: false`). Debezium reconnects and streams unacknowledged WAL segments without message loss.
 
 ---
 
-## Future Improvements
+## 21. Known Production Considerations
 
-- [ ] Add JWT authentication for API and WebSocket connections
-- [ ] Implement pagination and filtering on `GET /api/orders`
-- [ ] Add Socket.IO Redis adapter for multi-instance deployment
-- [ ] Add request rate limiting
-- [ ] Add structured logging (e.g., pino)
-- [ ] Write automated integration tests
-- [ ] Add order history / audit trail table
-- [ ] Containerize with Docker and docker-compose
-
----
-
-## Screenshots
-
-> Screenshots can be added here after running the application locally. Open `http://localhost:3000`, perform some SQL operations, and capture the real-time updates appearing in the browser.
+1. **Replication Slot WAL Retention**: If Debezium remains offline for days, PostgreSQL retains WAL files on disk for `orders_cdc_slot`. Set `max_slot_wal_keep_size` in PostgreSQL configuration to prevent disk exhaustion.
+2. **Horizontal Scaling**: Multiple instances of `app` sharing `KAFKA_GROUP_ID=order-monitoring-group` will load-balance Kafka topic partitions automatically. A Socket.IO Redis adapter can be added to route events across multi-node socket servers.
+3. **Partition Ordering**: Events for each order are partitioned by `orders.id` (primary key), guaranteeing total in-order delivery per order.

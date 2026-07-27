@@ -1,5 +1,7 @@
 import { Server } from 'socket.io';
-import dbListener from '../services/databaseListener.js';
+import cdcConsumer from '../services/cdcConsumer.js';
+
+let isListenerRegistered = false;
 
 const initSocket = (httpServer) => {
   const io = new Server(httpServer);
@@ -12,10 +14,13 @@ const initSocket = (httpServer) => {
     });
   });
 
-  // Bridge: one DB listener → all connected clients
-  dbListener.on('order_change', (payload) => {
-    io.emit('order-change', payload);
-  });
+  // Bridge: decoupled internal CDC consumer event -> Socket.IO 'order-change' broadcast
+  if (!isListenerRegistered) {
+    cdcConsumer.on('order_change', (payload) => {
+      io.emit('order-change', payload);
+    });
+    isListenerRegistered = true;
+  }
 
   return io;
 };

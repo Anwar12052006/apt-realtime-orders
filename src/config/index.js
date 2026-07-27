@@ -18,6 +18,13 @@ const config = {
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
   },
+
+  kafka: {
+    brokers: (process.env.KAFKA_BROKERS || 'localhost:9092').split(','),
+    clientId: process.env.KAFKA_CLIENT_ID || 'realtime-orders-app',
+    groupId: process.env.KAFKA_GROUP_ID || 'order-monitoring-group',
+    topic: process.env.KAFKA_TOPIC || 'cdc.public.orders',
+  },
 };
 
 export default config;
